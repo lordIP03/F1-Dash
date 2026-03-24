@@ -1,0 +1,97 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: #0b0f14;
+  color: #f5f6fa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #0b0f14;
+}
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #1d232f;
+  background: #0f141c;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.55rem;
+}
+
+.header p {
+  margin: 0.25rem 0;
+  color: #b6bed0;
+}
+
+.header span {
+  color: #7f8aa3;
+  font-size: 0.9rem;
+}
+
+.content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.table-pane {
+  width: 40%;
+  border-right: 1px solid #1d232f;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.map-pane {
+  width: 60%;
+  padding: 1rem;
+  overflow: hidden;
+}
+
+h2 {
+  margin-top: 0;
+  font-size: 1.1rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.55rem 0.3rem;
+  border-bottom: 1px solid #1d232f;
+}
+
+th {
+  color: #8f99ad;
+  font-weight: 600;
+}
+
+tbody tr:hover {
+  background: #141c27;
+}
+
+svg {
+  width: 100%;
+  height: calc(100% - 2rem);
+  min-height: 460px;
+  background: #0f141c;
+  border: 1px solid #202938;
+  border-radius: 12px;
+}

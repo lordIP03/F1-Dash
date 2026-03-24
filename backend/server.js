@@ -2,13 +2,21 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import TRACK_LAYOUTS from './trackLayouts.js';
 
 const PORT = process.env.PORT || 4000;
 const OPENF1_BASE = 'https://api.openf1.org/v1';
 const POLL_INTERVAL_MS = 2000;
 
 const app = express();
-app.use(cors());
+const ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:4000',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
+app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json());
 
 app.get('/health', (_, res) => {
@@ -18,25 +26,34 @@ app.get('/health', (_, res) => {
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: '*'
+    origin: ALLOWED_ORIGINS
   }
 });
 
 const cache = {
   sessionKey: null,
   driverMap: new Map(),
-  lastPayload: { drivers: [] }
+  circuit: null,
+  trackLayout: null,
+  sessionType: null,
+  lastPayload: { drivers: [], track: null, sessionType: null }
 };
 
-async function fetchJson(pathCandidates) {
+async function fetchJson(pathCandidates, timeoutMs = 5000) {
   for (const path of pathCandidates) {
     try {
-      const response = await fetch(`${OPENF1_BASE}${path}`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      
+      const response = await fetch(`${OPENF1_BASE}${path}`, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      
       if (!response.ok) continue;
       const data = await response.json();
       if (Array.isArray(data)) return data;
-    } catch (_) {
+    } catch (error) {
       // try next candidate
+      if (error instanceof TypeError) console.warn(`Fetch error for ${path}:`, error.message);
     }
   }
   return [];
@@ -88,6 +105,37 @@ async function updateDriverMap(sessionKey) {
   cache.driverMap = map;
 }
 
+async function updateCircuit(sessionKey) {
+  const sessions = await fetchJson([
+    `/sessions?session_key=${sessionKey}`,
+    `/sessions?meeting_key=latest`
+  ]);
+  
+  if (sessions.length > 0) {
+    const session = sessions[0];
+    
+    // Extract session type (Practice 1, Practice 2, Practice 3, Qualifying, Race)
+    cache.sessionType = session.session_type || 'Unknown';
+    
+    if (session.circuit_key) {
+      const circuitKey = session.circuit_key;
+      const circuitData = await fetchJson([`/circuits?circuit_key=${circuitKey}`]);
+      
+      if (circuitData.length > 0) {
+        const circuit = circuitData[0];
+        cache.circuit = {
+          name: circuit.circuit_name || 'Unknown',
+          country: circuit.country_name || 'Unknown',
+          key: circuitKey
+        };
+        
+        // Get track layout from TRACK_LAYOUTS using circuit key
+        cache.trackLayout = TRACK_LAYOUTS[circuitKey] || TRACK_LAYOUTS[1]; // Fallback to Australia
+      }
+    }
+  }
+}
+
 async function fetchDashboardData() {
   const sessionKey = cache.sessionKey || (await getLatestSessionKey());
   if (!sessionKey) return cache.lastPayload;
@@ -95,9 +143,10 @@ async function fetchDashboardData() {
   if (cache.sessionKey !== sessionKey || cache.driverMap.size === 0) {
     cache.sessionKey = sessionKey;
     await updateDriverMap(sessionKey);
+    await updateCircuit(sessionKey);
   }
 
-  const [positions, laps, intervals, locations] = await Promise.all([
+  const results = await Promise.allSettled([
     fetchJson([
       `/position?session_key=${sessionKey}`,
       `/positions?session_key=${sessionKey}`
@@ -114,16 +163,19 @@ async function fetchDashboardData() {
     ])
   ]);
 
+  const [positions, laps, intervals, locations] = results.map((r) => r.status === 'fulfilled' ? r.value : []);
+
   const latestPosByDriver = getLatestByDriver(positions);
   const latestLapByDriver = getLatestByDriver(laps);
   const latestIntervalByDriver = getLatestByDriver(intervals);
   const latestLocationByDriver = getLatestByDriver(locations);
 
   const topDrivers = [...latestPosByDriver.values()]
-    .filter((d) => Number.isFinite(Number(d.position)))
-    .sort((a, b) => Number(a.position) - Number(b.position))
+    .filter((d) => d && Number.isFinite(Number(d.position)))
+    .sort((a, b) => Number(a?.position || 0) - Number(b?.position || 0))
     .slice(0, 10)
     .map((pos) => {
+      if (!pos || pos.driver_number == null) return null;
       const driverNum = pos.driver_number;
       const lap = latestLapByDriver.get(driverNum) || {};
       const interval = latestIntervalByDriver.get(driverNum) || {};
@@ -132,17 +184,26 @@ async function fetchDashboardData() {
       return {
         position: Number(pos.position) || 0,
         code: cache.driverMap.get(driverNum) || String(driverNum),
-        lapTime: formatTime(lap.lap_duration),
-        sector1: formatTime(lap.duration_sector_1),
-        sector2: formatTime(lap.duration_sector_2),
-        sector3: formatTime(lap.duration_sector_3),
-        gap: interval.interval_to_leader ? String(interval.interval_to_leader) : '-',
-        x: normalizeCoordinate(location.x),
-        y: normalizeCoordinate(location.y)
+        lapTime: formatTime(lap?.lap_duration),
+        sector1: formatTime(lap?.duration_sector_1),
+        sector2: formatTime(lap?.duration_sector_2),
+        sector3: formatTime(lap?.duration_sector_3),
+        gap: interval?.interval_to_leader ? String(interval.interval_to_leader) : '-',
+        x: normalizeCoordinate(location?.x),
+        y: normalizeCoordinate(location?.y)
       };
-    });
+    }).filter(Boolean);
 
-  const payload = { drivers: topDrivers };
+  const payload = {
+    drivers: topDrivers,
+    track: cache.trackLayout ? {
+      name: cache.circuit?.name || 'Unknown',
+      country: cache.circuit?.country || 'Unknown',
+      svg: cache.trackLayout.svg,
+      bounds: cache.trackLayout.bounds
+    } : null,
+    sessionType: cache.sessionType
+  };
   cache.lastPayload = payload;
   return payload;
 }
@@ -161,8 +222,17 @@ io.on('connection', (socket) => {
   socket.emit('timing:update', cache.lastPayload);
 });
 
-setInterval(tick, POLL_INTERVAL_MS);
+const tickInterval = setInterval(tick, POLL_INTERVAL_MS);
 tick();
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  clearInterval(tickInterval);
+  httpServer.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
 
 httpServer.listen(PORT, () => {
   console.log(`F1-Dash backend listening on http://localhost:${PORT}`);

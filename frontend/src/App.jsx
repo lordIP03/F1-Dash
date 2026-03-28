@@ -3,10 +3,20 @@ import { io } from 'socket.io-client';
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:4000';
 
-function normalizePoints(drivers, width, height, trackBounds) {
-  const withCoords = drivers.filter((d) => d.x !== 0 || d.y !== 0);
+function normalizePoints(drivers, width, height, track) {
+  if (!track || !track.bounds) return drivers.map(d => ({ ...d, px: -999, py: -999 }));
 
-  if (withCoords.length < 2 || !trackBounds) {
+  if (track.isDynamic) {
+    return drivers.map(d => ({
+      ...d,
+      px: d.x !== 0 ? d.x : -999,
+      py: d.x !== 0 ? -d.y : -999
+    }));
+  }
+
+  // Hand-drawn tracks fallback
+  const withCoords = drivers.filter((d) => d.x !== 0 || d.y !== 0);
+  if (withCoords.length < 2) {
     return drivers.map((d, index) => {
       const angle = (index / Math.max(drivers.length, 1)) * Math.PI * 2;
       return {
@@ -17,17 +27,14 @@ function normalizePoints(drivers, width, height, trackBounds) {
     });
   }
 
-  const minX = trackBounds.minX;
-  const maxX = trackBounds.maxX;
-  const minY = trackBounds.minY;
-  const maxY = trackBounds.maxY;
+  const { minX, maxX, minY, maxY } = track.bounds;
   const spanX = maxX - minX || 1;
   const spanY = maxY - minY || 1;
   const padding = 20;
 
   return drivers.map((d) => {
-    const px = padding + ((d.x - minX) / spanX) * (width - padding * 2);
-    const py = padding + ((d.y - minY) / spanY) * (height - padding * 2);
+    const px = d.x !== 0 ? padding + ((d.x - minX) / spanX) * (width - padding * 2) : -999;
+    const py = d.y !== 0 ? padding + ((d.y - minY) / spanY) * (height - padding * 2) : -999;
     return { ...d, px, py };
   });
 }
@@ -39,6 +46,7 @@ export default function App() {
   const [track, setTrack] = useState(null);
   const [sessionType, setSessionType] = useState(null);
   const [currentLap, setCurrentLap] = useState(0);
+  const [authError, setAuthError] = useState(false);
 
   // Nav state
   const [activeTab, setActiveTab] = useState('live');
@@ -63,6 +71,7 @@ export default function App() {
       setTrack(payload?.track ?? null);
       setSessionType(payload?.sessionType ?? null);
       setCurrentLap(payload?.currentLap ?? 0);
+      setAuthError(payload?.authError ?? false);
       setLastUpdate(new Date());
     };
 
@@ -102,8 +111,8 @@ export default function App() {
   }, [selectedRace, activeTab]);
 
   const plottedDrivers = useMemo(
-    () => normalizePoints(drivers, 900, 620, track?.bounds),
-    [drivers, track?.bounds]
+    () => normalizePoints(drivers, 900, 620, track),
+    [drivers, track]
   );
 
   return (
@@ -141,6 +150,15 @@ export default function App() {
           </header>
 
           <main className="content">
+            {authError && (
+              <div style={{ backgroundColor: '#e74c3c', color: '#fff', padding: '12px 20px', borderRadius: '6px', marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '15px', width: '100%', boxSizing: 'border-box' }}>
+                <span style={{ fontSize: '1.5rem' }}>🔒</span>
+                <div>
+                  <div style={{ fontWeight: 'bold', fontSize: '1.1rem', marginBottom: '2px' }}>Live Session Restricted by OpenF1</div>
+                  <div style={{ fontSize: '0.9rem', opacity: 0.95 }}>Global API access is restricted during live sessions. Add OPENF1_API_KEY to your backend to view live telemetry.</div>
+                </div>
+              </div>
+            )}
             <section className="table-pane">
               <h2>Timing</h2>
               <table>
@@ -182,28 +200,47 @@ export default function App() {
 
             <section className="map-pane">
               <h2>Track Map</h2>
-              <svg viewBox="0 0 300 350" role="img" aria-label="Live track map">
-                {track ? (
-                  <path
-                    d={track.svg}
-                    fill="none"
-                    stroke="#404858"
-                    strokeWidth="2"
-                  />
-                ) : (
-                  <text x="150" y="175" textAnchor="middle" fill="#f5f6fa">
-                    Waiting for track data...
+              {track && track.bounds ? (() => {
+                const tvb = track.isDynamic
+                  ? `${track.bounds.minX} ${track.bounds.minY} ${track.bounds.maxX - track.bounds.minX} ${track.bounds.maxY - track.bounds.minY}`
+                  : "0 0 300 350";
+                const spanX = track.bounds.maxX - track.bounds.minX;
+                const sw = track.isDynamic ? spanX * 0.005 : 2;
+                const cr = track.isDynamic ? spanX * 0.015 : 4;
+                const ts = track.isDynamic ? spanX * 0.03 : 6;
+                const toX = track.isDynamic ? spanX * 0.02 : 6;
+                const toY = track.isDynamic ? track.isDynamic ? -spanX * 0.01 : -4 : -4;
+                
+                return (
+                  <svg viewBox={tvb} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Live track map">
+                    <path
+                      d={track.svg}
+                      fill="none"
+                      stroke="#404858"
+                      strokeWidth={sw}
+                    />
+                    {plottedDrivers.length === 0 && !authError && <text x={track.bounds.minX + spanX/2} y={track.bounds.minY + (track.bounds.maxY - track.bounds.minY)/2} textAnchor="middle" fill="#f5f6fa" fontSize={ts*2}>Waiting for telemetry...</text>}
+                    {authError && <text x={track.bounds.minX + spanX/2} y={track.bounds.minY + (track.bounds.maxY - track.bounds.minY)/2} textAnchor="middle" fill="#e74c3c" fontSize={ts*1.5}>API Key Required (401)</text>}
+                    {plottedDrivers.map((driver) => {
+                      if (driver.px === -999) return null;
+                      return (
+                        <g key={`dot-${driver.code}`}>
+                          <circle cx={driver.px} cy={driver.py} r={cr} fill={driver.teamColour} stroke="#fff" strokeWidth={sw / 4 || 0.5} />
+                          <text x={driver.px + toX} y={driver.py + toY} fill="#f5f6fa" fontSize={ts} fontWeight="600">
+                            {driver.code}
+                          </text>
+                        </g>
+                      );
+                    })}
+                  </svg>
+                );
+              })() : (
+                <svg viewBox="0 0 300 350" role="img" aria-label="Live track map">
+                  <text x="150" y="175" textAnchor="middle" fill={authError ? "#e74c3c" : "#f5f6fa"}>
+                    {authError ? "API Key Required (401)" : "Waiting for track data..."}
                   </text>
-                )}
-                {plottedDrivers.map((driver) => (
-                  <g key={`dot-${driver.code}`}>
-                    <circle cx={driver.px} cy={driver.py} r="4" fill={driver.teamColour} stroke="#fff" strokeWidth="0.5" />
-                    <text x={driver.px + 6} y={driver.py - 4} fill="#f5f6fa" fontSize="6" fontWeight="600">
-                      {driver.code}
-                    </text>
-                  </g>
-                ))}
-              </svg>
+                </svg>
+              )}
             </section>
           </main>
         </>

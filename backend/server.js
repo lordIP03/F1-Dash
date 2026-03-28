@@ -7,6 +7,7 @@ import TRACK_LAYOUTS from './trackLayouts.js';
 const PORT = process.env.PORT || 4000;
 const OPENF1_BASE = 'https://api.openf1.org/v1';
 const POLL_INTERVAL_MS = 2000;
+const OPENF1_API_KEY = process.env.OPENF1_API_KEY || '';
 
 const app = express();
 const ALLOWED_ORIGINS = [
@@ -98,6 +99,8 @@ const cache = {
   lastPitFetchTime: 0,
   lastMapFetchTime: 0,
   lastStandingsFetchTime: 0,
+  lastSessionFetchTime: 0,
+  authError: false,
   pitData: [],
   positions: [],
   laps: [],
@@ -111,8 +114,17 @@ async function fetchJson(pathCandidates, timeoutMs = 5000) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       
-      const response = await fetch(`${OPENF1_BASE}${path}`, { signal: controller.signal });
+      const separator = path.includes('?') ? '&' : '?';
+      const url = OPENF1_API_KEY ? `${OPENF1_BASE}${path}${separator}api_key=${OPENF1_API_KEY}` : `${OPENF1_BASE}${path}`;
+      
+      const response = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
+      
+      if (response.status === 401) {
+        cache.authError = true;
+      } else if (response.ok) {
+        cache.authError = false;
+      }
       
       if (!response.ok) continue;
       const data = await response.json();
@@ -182,6 +194,68 @@ async function updateDriverMap(sessionKey) {
   cache.driverMap = map;
 }
 
+let trackGenerationPromise = null;
+
+async function ensureDynamicTrackSVG(sessionKey) {
+  if (cache.trackLayout && cache.trackLayout.isDynamic) return;
+  if (trackGenerationPromise) return;
+
+  trackGenerationPromise = (async () => {
+    try {
+      const laps = await fetchJson([`/laps?session_key=${sessionKey}`]);
+      const validLap = laps.find(l => l.duration_sector_1 && l.duration_sector_2 && l.duration_sector_3 && l.lap_duration);
+      if (!validLap) return;
+
+      const startTime = new Date(validLap.date_start);
+      const endTime = new Date(startTime.getTime() + (validLap.lap_duration * 1000) + 2000); // 2s pad
+      
+      const locs = await fetchJson([
+        `/location?session_key=${sessionKey}&driver_number=${validLap.driver_number}&date%3E%3D${startTime.toISOString()}&date%3C%3D${endTime.toISOString()}`
+      ]);
+
+      if (!locs || locs.length < 10) return;
+
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      let path = '';
+
+      locs.forEach((l, i) => {
+        if (l.x < minX) minX = l.x;
+        if (l.x > maxX) maxX = l.x;
+        if (l.y < minY) minY = l.y;
+        if (l.y > maxY) maxY = l.y;
+
+        const invY = -l.y;
+        if (i === 0) path += `M${l.x.toFixed(2)} ${invY.toFixed(2)} `;
+        else path += `L${l.x.toFixed(2)} ${invY.toFixed(2)} `;
+      });
+      path += 'Z';
+
+      const padding = 500;
+      cache.trackLayout = {
+        svg: path,
+        bounds: { 
+          minX: minX - padding, 
+          maxX: maxX + padding, 
+          minY: -maxY - padding, 
+          maxY: -minY + padding 
+        },
+        isDynamic: true
+      };
+      
+      if (cache.lastPayload && cache.lastPayload.track) {
+        cache.lastPayload.track.svg = cache.trackLayout.svg;
+        cache.lastPayload.track.bounds = cache.trackLayout.bounds;
+        cache.lastPayload.track.isDynamic = true;
+      }
+      console.log('Dynamic track SVG built successfully from telemetry.');
+    } catch (err) {
+      console.error('Failed dynamic track generation:', err.message);
+    } finally {
+      trackGenerationPromise = null;
+    }
+  })();
+}
+
 async function updateCircuit(sessionKey) {
   const sessions = await fetchJson([
     `/sessions?session_key=${sessionKey}`,
@@ -196,35 +270,51 @@ async function updateCircuit(sessionKey) {
     
     if (session.circuit_key) {
       const circuitKey = session.circuit_key;
-      const circuitData = await fetchJson([`/circuits?circuit_key=${circuitKey}`]);
       
-      if (circuitData.length > 0) {
-        const circuit = circuitData[0];
-        cache.circuit = {
-          name: circuit.circuit_name || 'Unknown',
-          country: circuit.country_name || 'Unknown',
-          key: circuitKey
-        };
-        
-        // Get track layout from TRACK_LAYOUTS using circuit key
-        cache.trackLayout = TRACK_LAYOUTS[circuitKey] || TRACK_LAYOUTS[1]; // Fallback to Australia
-      }
+      cache.circuit = {
+        name: session.circuit_short_name || 'Unknown',
+        country: session.country_key || session.country_name || 'Unknown',
+        key: circuitKey
+      };
+      
+      // Get track layout from TRACK_LAYOUTS using circuit key
+      cache.trackLayout = TRACK_LAYOUTS[circuitKey] || TRACK_LAYOUTS[1]; // Fallback to Australia
+      
+      ensureDynamicTrackSVG(sessionKey);
     }
   }
 }
 
 async function fetchDashboardData() {
-  const sessionKey = cache.sessionKey || (await getLatestSessionKey());
+  const now = Date.now();
+  let sessionKey = cache.sessionKey;
+
+  // Re-check the latest session every 30 seconds
+  if (!sessionKey || now - (cache.lastSessionFetchTime || 0) >= 30000) {
+    const latestSessionKey = await getLatestSessionKey();
+    if (latestSessionKey) {
+      sessionKey = latestSessionKey;
+    }
+    cache.lastSessionFetchTime = now;
+  }
+
   if (!sessionKey) return cache.lastPayload;
 
   if (cache.sessionKey !== sessionKey || cache.driverMap.size === 0) {
+    console.log(`Switching session key: ${cache.sessionKey} -> ${sessionKey}`);
     cache.sessionKey = sessionKey;
+    
+    // Clear old session telemetry data
+    cache.positions = [];
+    cache.laps = [];
+    cache.intervals = [];
+    cache.locations = [];
+    cache.pitData = [];
+    
     await updateDriverMap(sessionKey);
     await updateCircuit(sessionKey);
   }
 
-  const now = Date.now();
-  
   const fetchMap = now - (cache.lastMapFetchTime || 0) >= 6000;
   const fetchStandings = now - (cache.lastStandingsFetchTime || 0) >= 10000;
   const fetchPit = now - cache.lastPitFetchTime > 180000;
@@ -320,10 +410,12 @@ async function fetchDashboardData() {
       name: cache.circuit?.name || 'Unknown',
       country: cache.circuit?.country || 'Unknown',
       svg: cache.trackLayout.svg,
-      bounds: cache.trackLayout.bounds
+      bounds: cache.trackLayout.bounds,
+      isDynamic: cache.trackLayout.isDynamic || false
     } : null,
     sessionType: cache.sessionType,
-    currentLap: currentLap
+    currentLap: currentLap,
+    authError: cache.authError
   };
   cache.lastPayload = payload;
   return payload;
